@@ -1,13 +1,25 @@
+/*
+ * Copyright (c) 2012-2018 The original author or authors
+ * ------------------------------------------------------
+ * All rights reserved. This program and the accompanying materials
+ * are made available under the terms of the Eclipse Public License v1.0
+ * and Apache License v2.0 which accompanies this distribution.
+ *
+ * The Eclipse Public License is available at
+ * http://www.eclipse.org/legal/epl-v10.html
+ *
+ * The Apache License v2.0 is available at
+ * http://www.opensource.org/licenses/apache2.0.php
+ *
+ * You may elect to redistribute this code under either of these licenses.
+ */
 package io.moquette.broker;
 
-import io.moquette.persistence.MemoryStorageService;
-import io.moquette.spi.ISessionsStore;
-import io.moquette.spi.impl.MockAuthenticator;
-import io.moquette.spi.impl.SessionsRepository;
-import io.moquette.spi.impl.security.PermitAllAuthorizatorPolicy;
-import io.moquette.spi.impl.subscriptions.CTrieSubscriptionDirectory;
-import io.moquette.spi.impl.subscriptions.ISubscriptionsDirectory;
-import io.moquette.spi.security.IAuthenticator;
+import io.moquette.broker.security.PermitAllAuthorizatorPolicy;
+import io.moquette.broker.subscriptions.CTrieSubscriptionDirectory;
+import io.moquette.broker.subscriptions.ISubscriptionsDirectory;
+import io.moquette.broker.security.IAuthenticator;
+import io.moquette.persistence.MemorySubscriptionsRepository;
 import io.netty.channel.Channel;
 import io.netty.channel.embedded.EmbeddedChannel;
 import io.netty.handler.codec.mqtt.MqttConnectMessage;
@@ -16,7 +28,7 @@ import io.netty.handler.codec.mqtt.MqttVersion;
 import org.junit.Before;
 import org.junit.Test;
 
-import static io.moquette.spi.impl.NettyChannelAssertions.assertEqualsConnAck;
+import static io.moquette.broker.NettyChannelAssertions.assertEqualsConnAck;
 import static io.netty.handler.codec.mqtt.MqttConnectReturnCode.*;
 import static java.util.Collections.singleton;
 import static java.util.Collections.singletonMap;
@@ -37,24 +49,27 @@ public class MQTTConnectionConnectTest {
     private EmbeddedChannel channel;
     private SessionRegistry sessionRegistry;
     private MqttMessageBuilders.ConnectBuilder connMsg;
-    private static final BrokerConfiguration CONFIG = new BrokerConfiguration(true, true, false);
+    private static final BrokerConfiguration CONFIG = new BrokerConfiguration(true, true, false, false);
     private IAuthenticator mockAuthenticator;
     private PostOffice postOffice;
+    private MemoryQueueRepository queueRepository;
 
     @Before
     public void setUp() {
         connMsg = MqttMessageBuilders.connect().protocolVersion(MqttVersion.MQTT_3_1).cleanSession(true);
 
-        MemoryStorageService memStorage = new MemoryStorageService(null, null);
-        ISessionsStore sessionStore = memStorage.sessionsStore();
         mockAuthenticator = new MockAuthenticator(singleton(FAKE_CLIENT_ID), singletonMap(TEST_USER, TEST_PWD));
 
         ISubscriptionsDirectory subscriptions = new CTrieSubscriptionDirectory();
-        SessionsRepository sessionsRepository = new SessionsRepository(sessionStore, null);
-        subscriptions.init(sessionsRepository);
+        ISubscriptionsRepository subscriptionsRepository = new MemorySubscriptionsRepository();
+        subscriptions.init(subscriptionsRepository);
+        queueRepository = new MemoryQueueRepository();
 
-        sessionRegistry = new SessionRegistry(subscriptions);
-        postOffice = new PostOffice(subscriptions, new PermitAllAuthorizatorPolicy(), new MemoryRetainedRepository(), sessionRegistry);
+        final PermitAllAuthorizatorPolicy authorizatorPolicy = new PermitAllAuthorizatorPolicy();
+        final Authorizator permitAll = new Authorizator(authorizatorPolicy);
+        sessionRegistry = new SessionRegistry(subscriptions, queueRepository, permitAll);
+        postOffice = new PostOffice(subscriptions, new MemoryRetainedRepository(), sessionRegistry,
+                                    ConnectionTestUtils.NO_OBSERVERS_INTERCEPTOR, permitAll);
 
         sut = createMQTTConnection(CONFIG);
         channel = (EmbeddedChannel) sut.channel;
@@ -145,7 +160,7 @@ public class MQTTConnectionConnectTest {
 
         // Verify
         verify(postOfficeMock).fireWill(any(Session.Will.class));
-        assertFalse("Connection is accepted and therefore should remain open", channel.isOpen());
+        assertFalse("Connection MUST be disconnected", sut.isConnected());
     }
 
     @Test
@@ -190,7 +205,7 @@ public class MQTTConnectionConnectTest {
     @Test
     public void prohibitAnonymousClient() {
         MqttConnectMessage msg = connMsg.clientId(FAKE_CLIENT_ID).build();
-        BrokerConfiguration config = new BrokerConfiguration(false, true, false);
+        BrokerConfiguration config = new BrokerConfiguration(false, true, false, false);
 
         sut = createMQTTConnection(config);
         channel = (EmbeddedChannel) sut.channel;
@@ -208,7 +223,7 @@ public class MQTTConnectionConnectTest {
         MqttConnectMessage msg = connMsg.clientId(FAKE_CLIENT_ID)
             .username(TEST_USER + "_fake")
             .build();
-        BrokerConfiguration config = new BrokerConfiguration(false, true, false);
+        BrokerConfiguration config = new BrokerConfiguration(false, true, false, false);
 
         createMQTTConnection(config);
 
@@ -222,7 +237,7 @@ public class MQTTConnectionConnectTest {
 
     @Test
     public void testZeroByteClientIdNotAllowed() {
-        BrokerConfiguration config = new BrokerConfiguration(false, false, false);
+        BrokerConfiguration config = new BrokerConfiguration(false, false, false, false);
 
         sut = createMQTTConnection(config);
         channel = (EmbeddedChannel) sut.channel;
@@ -273,7 +288,7 @@ public class MQTTConnectionConnectTest {
         EmbeddedChannel evilChannel = new EmbeddedChannel();
 
         // Exercise
-        BrokerConfiguration config = new BrokerConfiguration(true, true, false);
+        BrokerConfiguration config = new BrokerConfiguration(true, true, false, false);
         final MQTTConnection evilConnection = createMQTTConnection(config, evilChannel, postOffice);
         evilConnection.processConnect(evilClientConnMsg);
 

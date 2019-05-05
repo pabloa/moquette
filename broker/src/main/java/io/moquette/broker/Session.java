@@ -1,12 +1,29 @@
+/*
+ * Copyright (c) 2012-2018 The original author or authors
+ * ------------------------------------------------------
+ * All rights reserved. This program and the accompanying materials
+ * are made available under the terms of the Eclipse Public License v1.0
+ * and Apache License v2.0 which accompanies this distribution.
+ *
+ * The Eclipse Public License is available at
+ * http://www.eclipse.org/legal/epl-v10.html
+ *
+ * The Apache License v2.0 is available at
+ * http://www.opensource.org/licenses/apache2.0.php
+ *
+ * You may elect to redistribute this code under either of these licenses.
+ */
 package io.moquette.broker;
 
-import io.moquette.spi.impl.subscriptions.Subscription;
-import io.moquette.spi.impl.subscriptions.Topic;
+import io.moquette.broker.subscriptions.Subscription;
+import io.moquette.broker.subscriptions.Topic;
 import io.netty.buffer.ByteBuf;
 import io.netty.handler.codec.mqtt.*;
+import io.netty.util.ReferenceCountUtil;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import java.net.InetSocketAddress;
 import java.util.*;
 import java.util.concurrent.DelayQueue;
 import java.util.concurrent.Delayed;
@@ -20,7 +37,7 @@ class Session {
     private static final int FLIGHT_BEFORE_RESEND_MS = 5_000;
     private static final int INFLIGHT_WINDOW_SIZE = 10;
 
-    class InFlightPacket implements Delayed {
+    static class InFlightPacket implements Delayed {
 
         final int packetId;
         private long startTime;
@@ -81,13 +98,11 @@ class Session {
     private final AtomicInteger inflightSlots = new AtomicInteger(INFLIGHT_WINDOW_SIZE); // this should be configurable
 
     Session(String clientId, boolean clean, Will will, Queue<SessionRegistry.EnqueuedMessage> sessionQueue) {
-        this.clientId = clientId;
-        this.clean = clean;
+        this(clientId, clean, sessionQueue);
         this.will = will;
-        this.sessionQueue = sessionQueue;
     }
 
-    Session(boolean clean, String clientId, Queue<SessionRegistry.EnqueuedMessage> sessionQueue) {
+    Session(String clientId, boolean clean, Queue<SessionRegistry.EnqueuedMessage> sessionQueue) {
         this.clientId = clientId;
         this.clean = clean;
         this.sessionQueue = sessionQueue;
@@ -165,7 +180,7 @@ class Session {
         inflightSlots.incrementAndGet();
         if (canSkipQueue()) {
             inflightSlots.decrementAndGet();
-            int pubRelPacketId = mqttConnection.nextPacketId();
+            int pubRelPacketId = packetId/*mqttConnection.nextPacketId()*/;
             inflightWindow.put(pubRelPacketId, new SessionRegistry.PubRelMarker());
             inflightTimeouts.add(new InFlightPacket(pubRelPacketId, FLIGHT_BEFORE_RESEND_MS));
             MqttMessage pubRel = MQTTConnection.pubrel(pubRelPacketId);
@@ -184,8 +199,8 @@ class Session {
         drainQueueToConnection();
 
         // TODO notify the interceptor
-//                final InterceptAcknowledgedMessage interceptAckMsg = new InterceptAcknowledgedMessage(inflightMsg, topic,
-//                    username, messageID);
+//                final InterceptAcknowledgedMessage interceptAckMsg = new InterceptAcknowledgedMessage(inflightMsg,
+// topic, username, messageID);
 //                m_interceptor.notifyMessageAcknowledged(interceptAckMsg);
     }
 
@@ -218,7 +233,8 @@ class Session {
             int packetId = mqttConnection.nextPacketId();
             inflightWindow.put(packetId, new SessionRegistry.PublishedMessage(topic, qos, payload));
             inflightTimeouts.add(new InFlightPacket(packetId, FLIGHT_BEFORE_RESEND_MS));
-            MqttPublishMessage publishMsg = MQTTConnection.notRetainedPublishWithMessageId(topic.toString(), qos, payload, packetId);
+            MqttPublishMessage publishMsg = MQTTConnection.notRetainedPublishWithMessageId(topic.toString(), qos,
+                                                                                           payload, packetId);
             mqttConnection.sendPublish(publishMsg);
 
             // TODO drainQueueToConnection();?
@@ -234,7 +250,8 @@ class Session {
             int packetId = mqttConnection.nextPacketId();
             inflightWindow.put(packetId, new SessionRegistry.PublishedMessage(topic, qos, payload));
             inflightTimeouts.add(new InFlightPacket(packetId, FLIGHT_BEFORE_RESEND_MS));
-            MqttPublishMessage publishMsg = MQTTConnection.notRetainedPublishWithMessageId(topic.toString(), qos, payload, packetId);
+            MqttPublishMessage publishMsg = MQTTConnection.notRetainedPublishWithMessageId(topic.toString(), qos,
+                                                                                           payload, packetId);
             mqttConnection.sendPublish(publishMsg);
 
             drainQueueToConnection();
@@ -251,6 +268,12 @@ class Session {
             mqttConnection.channel.isWritable();
     }
 
+    private boolean inflighHasSlotsAndConnectionIsUp() {
+        return inflightSlots.get() > 0 &&
+            connected() &&
+            mqttConnection.channel.isWritable();
+    }
+
     void pubAckReceived(int ackPacketId) {
         // TODO remain to invoke in somehow m_interceptor.notifyMessageAcknowledged
         inflightWindow.remove(ackPacketId);
@@ -262,20 +285,36 @@ class Session {
         Collection<InFlightPacket> expired = new ArrayList<>(INFLIGHT_WINDOW_SIZE);
         inflightTimeouts.drainTo(expired);
 
+        debugLogPacketIds(expired);
+
         for (InFlightPacket notAckPacketId : expired) {
             if (inflightWindow.containsKey(notAckPacketId.packetId)) {
-                final SessionRegistry.PublishedMessage msg = (SessionRegistry.PublishedMessage) inflightWindow.get(notAckPacketId.packetId);
+                final SessionRegistry.PublishedMessage msg =
+                    (SessionRegistry.PublishedMessage) inflightWindow.get(notAckPacketId.packetId);
                 final Topic topic = msg.topic;
                 final MqttQoS qos = msg.publishingQos;
                 final ByteBuf payload = msg.payload;
-
-                MqttPublishMessage publishMsg = publishNotRetainedDuplicated(notAckPacketId, topic, qos, payload);
+                final ByteBuf copiedPayload = payload.retainedDuplicate();
+                MqttPublishMessage publishMsg = publishNotRetainedDuplicated(notAckPacketId, topic, qos, copiedPayload);
                 mqttConnection.sendPublish(publishMsg);
             }
         }
     }
 
-    private MqttPublishMessage publishNotRetainedDuplicated(InFlightPacket notAckPacketId, Topic topic, MqttQoS qos, ByteBuf payload) {
+    private void debugLogPacketIds(Collection<InFlightPacket> expired) {
+        if (!LOG.isDebugEnabled() || expired.isEmpty()) {
+            return;
+        }
+
+        StringBuilder sb = new StringBuilder();
+        for (InFlightPacket packet : expired) {
+            sb.append(packet.packetId).append(", ");
+        }
+        LOG.debug("Resending {} in flight packets [{}]", expired.size(), sb);
+    }
+
+    private MqttPublishMessage publishNotRetainedDuplicated(InFlightPacket notAckPacketId, Topic topic, MqttQoS qos,
+                                                            ByteBuf payload) {
         MqttFixedHeader fixedHeader = new MqttFixedHeader(MqttMessageType.PUBLISH, true, qos, false, 0);
         MqttPublishVariableHeader varHeader = new MqttPublishVariableHeader(topic.toString(), notAckPacketId.packetId);
         return new MqttPublishMessage(fixedHeader, varHeader, payload);
@@ -283,7 +322,7 @@ class Session {
 
     private void drainQueueToConnection() {
         // consume the queue
-        while (!canSkipQueue()) {
+        while (!sessionQueue.isEmpty() && inflighHasSlotsAndConnectionIsUp()) {
             final SessionRegistry.EnqueuedMessage msg = sessionQueue.remove();
             inflightSlots.decrementAndGet();
             int sendPacketId = mqttConnection.nextPacketId();
@@ -321,12 +360,20 @@ class Session {
 
     public void receivedPublishQos2(int messageID, MqttPublishMessage msg) {
         qos2Receiving.put(messageID, msg);
-        msg.retain();
+        msg.retain(); // retain to put in the inflight map
         mqttConnection.sendPublishReceived(messageID);
     }
 
     public void receivedPubRelQos2(int messageID) {
-        qos2Receiving.remove(messageID);
+        final MqttPublishMessage removedMsg = qos2Receiving.remove(messageID);
+        ReferenceCountUtil.release(removedMsg);
+    }
+
+    Optional<InetSocketAddress> remoteAddress() {
+        if (connected()) {
+            return Optional.of(mqttConnection.remoteAddress());
+        }
+        return Optional.empty();
     }
 
     @Override

@@ -1,16 +1,32 @@
+/*
+ * Copyright (c) 2012-2018 The original author or authors
+ * ------------------------------------------------------
+ * All rights reserved. This program and the accompanying materials
+ * are made available under the terms of the Eclipse Public License v1.0
+ * and Apache License v2.0 which accompanies this distribution.
+ *
+ * The Eclipse Public License is available at
+ * http://www.eclipse.org/legal/epl-v10.html
+ *
+ * The Apache License v2.0 is available at
+ * http://www.opensource.org/licenses/apache2.0.php
+ *
+ * You may elect to redistribute this code under either of these licenses.
+ */
 package io.moquette.broker;
 
-import io.moquette.server.netty.AutoFlushHandler;
-import io.moquette.server.netty.NettyUtils;
-import io.moquette.spi.impl.DebugUtils;
-import io.moquette.spi.impl.subscriptions.Topic;
-import io.moquette.spi.security.IAuthenticator;
+import io.moquette.broker.subscriptions.Topic;
+import io.moquette.broker.security.IAuthenticator;
 import io.netty.buffer.ByteBuf;
 import io.netty.channel.Channel;
+import io.netty.channel.ChannelFuture;
+import io.netty.channel.ChannelPipeline;
 import io.netty.handler.codec.mqtt.*;
+import io.netty.handler.timeout.IdleStateHandler;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import java.net.InetSocketAddress;
 import java.nio.charset.StandardCharsets;
 import java.util.*;
 import java.util.concurrent.TimeUnit;
@@ -76,8 +92,8 @@ final class MQTTConnection {
                 processPubAck(msg);
                 break;
             case PINGREQ:
-                MqttFixedHeader pingHeader = new MqttFixedHeader(MqttMessageType.PINGRESP,false, AT_MOST_ONCE,
-                                                                false,0);
+                MqttFixedHeader pingHeader = new MqttFixedHeader(MqttMessageType.PINGRESP, false, AT_MOST_ONCE,
+                                                                false, 0);
                 MqttMessage pingResp = new MqttMessage(pingHeader);
                 channel.writeAndFlush(pingResp).addListener(CLOSE_ON_FAILURE);
                 break;
@@ -124,20 +140,22 @@ final class MQTTConnection {
         final boolean cleanSession = msg.variableHeader().isCleanSession();
         if (clientId == null || clientId.length() == 0) {
             if (!brokerConfig.isAllowZeroByteClientId()) {
-                LOG.warn("Broker doesn't permit MQTT client ID empty. Username={}, channel: {}", username, channel);
+                LOG.warn("Broker doesn't permit MQTT empty client ID. Username: {}, channel: {}", username, channel);
                 abortConnection(CONNECTION_REFUSED_IDENTIFIER_REJECTED);
                 return;
             }
 
             if (!cleanSession) {
-                LOG.warn("MQTT client ID cannot be empty for persistent session. Username={}, channel: {}", username, channel);
+                LOG.warn("MQTT client ID cannot be empty for persistent session. Username: {}, channel: {}",
+                         username, channel);
                 abortConnection(CONNECTION_REFUSED_IDENTIFIER_REJECTED);
                 return;
             }
 
             // Generating client id.
             clientId = UUID.randomUUID().toString().replace("-", "");
-            LOG.debug("Client has connected with server generated id={}, username={}, channel: {}", clientId, username, channel);
+            LOG.debug("Client has connected with integration generated id: {}, username: {}, channel: {}", clientId,
+                      username, channel);
         }
 
         if (!login(msg, clientId)) {
@@ -150,10 +168,13 @@ final class MQTTConnection {
             LOG.trace("Binding MQTTConnection (channel: {}) to session", channel);
             sessionRegistry.bindToSession(this, msg, clientId);
 
+            initializeKeepAliveTimeout(channel, msg, clientId);
             setupInflightResender(channel);
 
             NettyUtils.clientID(channel, clientId);
             LOG.trace("CONNACK sent, channel: {}", channel);
+            postOffice.dispatchConnection(msg);
+            LOG.trace("dispatch connection: {}", msg.toString());
         } catch (SessionCorruptedException scex) {
             LOG.warn("MQTT session for client ID {} cannot be created, channel: {}", clientId, channel);
             abortConnection(CONNECTION_REFUSED_SERVER_UNAVAILABLE);
@@ -163,6 +184,25 @@ final class MQTTConnection {
     private void setupInflightResender(Channel channel) {
         channel.pipeline()
             .addFirst("inflightResender", new InflightResender(5_000, TimeUnit.MILLISECONDS));
+    }
+
+    private void initializeKeepAliveTimeout(Channel channel, MqttConnectMessage msg, String clientId) {
+        int keepAlive = msg.variableHeader().keepAliveTimeSeconds();
+        NettyUtils.keepAlive(channel, keepAlive);
+        NettyUtils.cleanSession(channel, msg.variableHeader().isCleanSession());
+        NettyUtils.clientID(channel, clientId);
+        int idleTime = Math.round(keepAlive * 1.5f);
+        setIdleTime(channel.pipeline(), idleTime);
+
+        LOG.debug("Connection has been configured CId={}, keepAlive={}, removeTemporaryQoS2={}, idleTime={}",
+            clientId, keepAlive, msg.variableHeader().isCleanSession(), idleTime);
+    }
+
+    private void setIdleTime(ChannelPipeline pipeline, int idleTime) {
+        if (pipeline.names().contains("idleStateHandler")) {
+            pipeline.remove("idleStateHandler");
+        }
+        pipeline.addFirst("idleStateHandler", new IdleStateHandler(idleTime, 0, 0));
     }
 
     private boolean isNotProtocolVersion(MqttConnectMessage msg, MqttVersion version) {
@@ -207,30 +247,38 @@ final class MQTTConnection {
 
     void handleConnectionLost() {
         String clientID = NettyUtils.clientID(channel);
-        if (clientID != null && !clientID.isEmpty()) {
-            LOG.info("Notifying connection lost event. CId = {}, channel: {}", clientID, channel);
-            Session session = sessionRegistry.retrieve(clientID);
-            if (session.hasWill()) {
-                postOffice.fireWill(session.getWill());
-            }
-            if (session.isClean()) {
-                sessionRegistry.remove(clientID);
-            } else {
-                sessionRegistry.disconnect(clientID);
-            }
-            connected = false;
+        if (clientID == null || clientID.isEmpty()) {
+            return;
         }
-        channel.close().addListener(CLOSE_ON_FAILURE);
+        LOG.info("Notifying connection lost event. CId: {}, channel: {}", clientID, channel);
+        Session session = sessionRegistry.retrieve(clientID);
+        if (session.hasWill()) {
+            postOffice.fireWill(session.getWill());
+        }
+        if (session.isClean()) {
+            sessionRegistry.remove(clientID);
+        } else {
+            sessionRegistry.disconnect(clientID);
+        }
+        connected = false;
+        //dispatch connection lost to intercept.
+        String userName = NettyUtils.userName(channel);
+        postOffice.dispatchConnectionLost(clientID,userName);
+        LOG.trace("dispatch disconnection: clientId={}, userName={}", clientID, userName);
     }
 
     void sendConnAck(boolean isSessionAlreadyPresent) {
         connected = true;
         final MqttConnAckMessage ackMessage = connAck(CONNECTION_ACCEPTED, isSessionAlreadyPresent);
-        channel.writeAndFlush(ackMessage);
+        channel.writeAndFlush(ackMessage).addListener(FIRE_EXCEPTION_ON_FAILURE);
+    }
+
+    boolean isConnected() {
+        return connected;
     }
 
     void dropConnection() {
-        channel.close();
+        channel.close().addListener(FIRE_EXCEPTION_ON_FAILURE);
     }
 
     void processDisconnect(MqttMessage msg) {
@@ -242,8 +290,11 @@ final class MQTTConnection {
         }
         sessionRegistry.disconnect(clientID);
         connected = false;
-        channel.close();
+        channel.close().addListener(FIRE_EXCEPTION_ON_FAILURE);
         LOG.trace("Processed DISCONNECT CId={}, channel: {}", clientID, channel);
+        String userName = NettyUtils.userName(channel);
+        postOffice.dispatchDisconnection(clientID,userName);
+        LOG.trace("dispatch disconnection: clientId={}, userName={}", clientID, userName);
     }
 
     void processSubscribe(MqttSubscribeMessage msg) {
@@ -296,7 +347,7 @@ final class MQTTConnection {
         }
         switch (qos) {
             case AT_MOST_ONCE:
-                postOffice.receivedPublishQos0(topic, username, clientId, payload, retain);
+                postOffice.receivedPublishQos0(topic, username, clientId, payload, retain, msg);
                 break;
             case AT_LEAST_ONCE: {
                 final int messageID = msg.variableHeader().packetId();
@@ -307,7 +358,7 @@ final class MQTTConnection {
                 final int messageID = msg.variableHeader().packetId();
                 final Session session = sessionRegistry.retrieve(clientId);
                 session.receivedPublishQos2(messageID, msg);
-                postOffice.receivedPublishQos2(this, msg);
+                postOffice.receivedPublishQos2(this, msg, username);
 //                msg.release();
                 break;
             }
@@ -348,8 +399,18 @@ final class MQTTConnection {
     }
 
     void sendIfWritableElseDrop(MqttMessage msg) {
+        if (LOG.isDebugEnabled()) {
+            LOG.debug("OUT {} on channel {}", msg.fixedHeader().messageType(), channel);
+        }
         if (channel.isWritable()) {
-            channel.write(msg);
+            ChannelFuture channelFuture;
+            if (brokerConfig.isImmediateBufferFlush()) {
+                channelFuture = channel.writeAndFlush(msg);
+            }
+            else {
+                channelFuture = channel.write(msg);
+            }
+            channelFuture.addListener(FIRE_EXCEPTION_ON_FAILURE);
         }
     }
 
@@ -378,6 +439,10 @@ final class MQTTConnection {
 
     String getClientId() {
         return NettyUtils.clientID(channel);
+    }
+
+    String getUsername() {
+        return NettyUtils.userName(channel);
     }
 
     public void sendPublishRetainedQos0(Topic topic, MqttQoS qos, ByteBuf payload) {
@@ -431,5 +496,9 @@ final class MQTTConnection {
     @Override
     public String toString() {
         return "MQTTConnection{channel=" + channel + ", connected=" + connected + '}';
+    }
+
+    InetSocketAddress remoteAddress() {
+        return (InetSocketAddress) channel.remoteAddress();
     }
 }

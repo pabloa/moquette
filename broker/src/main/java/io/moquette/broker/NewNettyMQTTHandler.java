@@ -16,7 +16,6 @@
 
 package io.moquette.broker;
 
-import io.moquette.server.netty.NettyUtils;
 import io.netty.channel.*;
 import io.netty.channel.ChannelHandler.Sharable;
 import io.netty.handler.codec.mqtt.MqttMessage;
@@ -53,10 +52,7 @@ public class NewNettyMQTTHandler extends ChannelInboundHandlerAdapter {
 
     @Override
     public void channelRead(ChannelHandlerContext ctx, Object message) throws Exception {
-        MqttMessage msg = (MqttMessage) message;
-        if (msg.fixedHeader() == null) {
-            throw new IOException("Unknown packet");
-        }
+        MqttMessage msg = NettyUtils.validateMessage(message);
         final MQTTConnection mqttConnection = mqttConnection(ctx.channel());
         try {
             mqttConnection.handleMessage(msg);
@@ -104,7 +100,7 @@ public class NewNettyMQTTHandler extends ChannelInboundHandlerAdapter {
     }
 
     @Override
-    public void userEventTriggered(ChannelHandlerContext ctx, Object evt) throws Exception {
+    public void userEventTriggered(ChannelHandlerContext ctx, Object evt) {
         if (evt instanceof InflightResender.ResendNotAckedPublishes) {
             final MQTTConnection mqttConnection = mqttConnection(ctx.channel());
             mqttConnection.resendNotAckedPublishes();

@@ -1,10 +1,26 @@
+/*
+ * Copyright (c) 2012-2018 The original author or authors
+ * ------------------------------------------------------
+ * All rights reserved. This program and the accompanying materials
+ * are made available under the terms of the Eclipse Public License v1.0
+ * and Apache License v2.0 which accompanies this distribution.
+ *
+ * The Eclipse Public License is available at
+ * http://www.eclipse.org/legal/epl-v10.html
+ *
+ * The Apache License v2.0 is available at
+ * http://www.opensource.org/licenses/apache2.0.php
+ *
+ * You may elect to redistribute this code under either of these licenses.
+ */
 package io.moquette.broker;
 
-import io.moquette.spi.impl.subscriptions.ISubscriptionsDirectory;
-import io.moquette.spi.impl.subscriptions.Subscription;
-import io.moquette.spi.impl.subscriptions.Topic;
-import io.moquette.spi.security.IAuthorizatorPolicy;
+import io.moquette.interception.BrokerInterceptor;
+import io.moquette.broker.subscriptions.ISubscriptionsDirectory;
+import io.moquette.broker.subscriptions.Subscription;
+import io.moquette.broker.subscriptions.Topic;
 import io.netty.buffer.ByteBuf;
+import io.netty.buffer.Unpooled;
 import io.netty.handler.codec.mqtt.*;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -14,7 +30,7 @@ import java.util.List;
 import java.util.Set;
 import java.util.stream.Collectors;
 
-import static io.moquette.spi.impl.Utils.messageId;
+import static io.moquette.broker.Utils.messageId;
 import static io.netty.handler.codec.mqtt.MqttMessageIdVariableHeader.from;
 import static io.netty.handler.codec.mqtt.MqttQoS.*;
 
@@ -26,13 +42,15 @@ class PostOffice {
     private final ISubscriptionsDirectory subscriptions;
     private final IRetainedRepository retainedRepository;
     private SessionRegistry sessionRegistry;
+    private BrokerInterceptor interceptor;
 
-    PostOffice(ISubscriptionsDirectory subscriptions, IAuthorizatorPolicy authorizatorPolicy,
-               IRetainedRepository retainedRepository, SessionRegistry sessionRegistry) {
-        this.authorizator = new Authorizator(authorizatorPolicy);
+    PostOffice(ISubscriptionsDirectory subscriptions, IRetainedRepository retainedRepository,
+               SessionRegistry sessionRegistry, BrokerInterceptor interceptor, Authorizator authorizator) {
+        this.authorizator = authorizator;
         this.subscriptions = subscriptions;
         this.retainedRepository = retainedRepository;
         this.sessionRegistry = sessionRegistry;
+        this.interceptor = interceptor;
     }
 
     public void init(SessionRegistry sessionRegistry) {
@@ -72,29 +90,30 @@ class PostOffice {
 
         publishRetainedMessagesForSubscriptions(clientID, newSubscriptions);
 
-        // TODO notify the Observables
-//        for (Subscription subscription : newSubscriptions) {
-//            m_interceptor.notifyTopicSubscribed(newSubscription, username);
-//        }
+        for (Subscription subscription : newSubscriptions) {
+            interceptor.notifyTopicSubscribed(subscription, username);
+        }
     }
 
     private void publishRetainedMessagesForSubscriptions(String clientID, List<Subscription> newSubscriptions) {
         Session targetSession = this.sessionRegistry.retrieve(clientID);
         for (Subscription subscription : newSubscriptions) {
             final String topicFilter = subscription.getTopicFilter().toString();
-            final MqttPublishMessage retainedMsg = retainedRepository.retainedOnTopic(topicFilter);
+            final List<RetainedMessage> retainedMsgs = retainedRepository.retainedOnTopic(topicFilter);
 
-            if (retainedMsg == null) {
+            if (retainedMsgs.isEmpty()) {
                 // not found
                 continue;
             }
+            for (RetainedMessage retainedMsg : retainedMsgs) {
+                final MqttQoS retainedQos = retainedMsg.qosLevel();
+                MqttQoS qos = lowerQosToTheSubscriptionDesired(subscription, retainedQos);
 
-            final MqttQoS retainedQos = retainedMsg.fixedHeader().qosLevel();
-            MqttQoS qos = lowerQosToTheSubscriptionDesired(subscription, retainedQos);
-
-            final ByteBuf origPayload = retainedMsg.payload();
-            ByteBuf payload = origPayload.retainedDuplicate();
-            targetSession.sendRetainedPublishOnSessionAtQos(subscription.getTopicFilter(), qos, payload);
+//                final ByteBuf origPayload = retainedMsg.getPayload();
+                final ByteBuf payloadBuf = Unpooled.wrappedBuffer(retainedMsg.getPayload());
+//                ByteBuf payload = origPayload.retainedDuplicate();
+                targetSession.sendRetainedPublishOnSessionAtQos(subscription.getTopicFilter(), qos, payloadBuf);
+            }
         }
     }
 
@@ -132,18 +151,18 @@ class PostOffice {
             // TODO remove the subscriptions to Session
 //            clientSession.unsubscribeFrom(topic);
 
-            //TODO notify interceptors
-//            String username = NettyUtils.userName(channel);
-//            m_interceptor.notifyTopicUnsubscribed(topic.toString(), clientID, username);
+            String username = NettyUtils.userName(mqttConnection.channel);
+            interceptor.notifyTopicUnsubscribed(topic.toString(), clientID, username);
         }
 
         // ack the client
         mqttConnection.sendUnsubAckMessage(topics, clientID, messageId);
     }
 
-    void receivedPublishQos0(Topic topic, String username, String clientID, ByteBuf payload, boolean retain) {
+    void receivedPublishQos0(Topic topic, String username, String clientID, ByteBuf payload, boolean retain,
+                             MqttPublishMessage msg) {
         if (!authorizator.canWrite(topic, username, clientID)) {
-            LOG.error("MQTT client is not authorized to publish on topic. CId={}, topic: {}", clientID, topic);
+            LOG.error("MQTT client: {} is not authorized to publish on topic: {}", clientID, topic);
             return;
         }
         publish2Subscribers(payload, topic, AT_MOST_ONCE);
@@ -152,8 +171,8 @@ class PostOffice {
             // QoS == 0 && retain => clean old retained
             retainedRepository.cleanRetained(topic);
         }
-// TODO
-//        m_interceptor.notifyTopicPublished(msg, clientID, username);
+
+        interceptor.notifyTopicPublished(msg, clientID, username);
     }
 
     void receivedPublishQos1(MQTTConnection connection, Topic topic, String username, ByteBuf payload, int messageID,
@@ -167,7 +186,7 @@ class PostOffice {
         }
         final String clientId = connection.getClientId();
         if (!authorizator.canWrite(topic, username, clientId)) {
-            LOG.error("MQTT client is not authorized to publish on topic. CId={}, topic: {}", clientId, topic);
+            LOG.error("MQTT client: {} is not authorized to publish on topic: {}", clientId, topic);
             return;
         }
 
@@ -183,8 +202,7 @@ class PostOffice {
                 retainedRepository.retain(topic, msg);
             }
         }
-//TODO
-//        m_interceptor.notifyTopicPublished(msg, clientID, username);
+        interceptor.notifyTopicPublished(msg, clientId, username);
     }
 
     private void publish2Subscribers(ByteBuf origPayload, Topic topic, MqttQoS publishingQos) {
@@ -214,10 +232,17 @@ class PostOffice {
      * First phase of a publish QoS2 protocol, sent by publisher to the broker. Publish to all interested
      * subscribers.
      */
-    void receivedPublishQos2(MQTTConnection connection, MqttPublishMessage mqttPublishMessage) {
+    void receivedPublishQos2(MQTTConnection connection, MqttPublishMessage mqttPublishMessage, String username) {
         LOG.trace("Processing PUBREL message on connection: {}", connection);
         final Topic topic = new Topic(mqttPublishMessage.variableHeader().topicName());
         final ByteBuf payload = mqttPublishMessage.payload();
+
+        final String clientId = connection.getClientId();
+        if (!authorizator.canWrite(topic, username, clientId)) {
+            LOG.error("MQTT client is not authorized to publish on topic. CId={}, topic: {}", clientId, topic);
+            return;
+        }
+
         publish2Subscribers(payload, topic, EXACTLY_ONCE);
 
         final boolean retained = mqttPublishMessage.fixedHeader().isRetain();
@@ -230,8 +255,8 @@ class PostOffice {
             }
         }
 
-        //TODO here we should notify to the listeners
-        //m_interceptor.notifyTopicPublished(msg, clientID, username);
+        String clientID = connection.getClientId();
+        interceptor.notifyTopicPublished(mqttPublishMessage, clientID, username);
     }
 
     static MqttQoS lowerQosToTheSubscriptionDesired(Subscription sub, MqttQoS qos) {
@@ -249,11 +274,9 @@ class PostOffice {
      * where it's publishing.
      *
      * @param msg
-     *            the message to publish.
-     * @param clientId
-     *            the clientID
+     *            the message to publish
      */
-    public void internalPublish(MqttPublishMessage msg, final String clientId) {
+    public void internalPublish(MqttPublishMessage msg) {
         final MqttQoS qos = msg.fixedHeader().qosLevel();
         final Topic topic = new Topic(msg.variableHeader().topicName());
         final ByteBuf payload = msg.payload();
@@ -270,5 +293,21 @@ class PostOffice {
             return;
         }
         retainedRepository.retain(topic, msg);
+    }
+
+    /**
+     * notify MqttConnectMessage after connection established (already pass login).
+     * @param msg
+     */
+    void dispatchConnection(MqttConnectMessage msg){
+        interceptor.notifyClientConnected(msg);
+    }
+
+    void dispatchDisconnection(String clientId,String userName){
+        interceptor.notifyClientDisconnected(clientId,userName);
+    }
+
+    void dispatchConnectionLost(String clientId,String userName){
+        interceptor.notifyClientConnectionLost(clientId,userName);
     }
 }

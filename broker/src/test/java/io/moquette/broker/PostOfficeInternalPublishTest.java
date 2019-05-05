@@ -1,14 +1,26 @@
+/*
+ * Copyright (c) 2012-2018 The original author or authors
+ * ------------------------------------------------------
+ * All rights reserved. This program and the accompanying materials
+ * are made available under the terms of the Eclipse Public License v1.0
+ * and Apache License v2.0 which accompanies this distribution.
+ *
+ * The Eclipse Public License is available at
+ * http://www.eclipse.org/legal/epl-v10.html
+ *
+ * The Apache License v2.0 is available at
+ * http://www.opensource.org/licenses/apache2.0.php
+ *
+ * You may elect to redistribute this code under either of these licenses.
+ */
 package io.moquette.broker;
 
-import io.moquette.persistence.MemoryStorageService;
-import io.moquette.spi.ISessionsStore;
-import io.moquette.spi.impl.MockAuthenticator;
-import io.moquette.spi.impl.SessionsRepository;
-import io.moquette.spi.impl.security.PermitAllAuthorizatorPolicy;
-import io.moquette.spi.impl.subscriptions.CTrieSubscriptionDirectory;
-import io.moquette.spi.impl.subscriptions.ISubscriptionsDirectory;
-import io.moquette.spi.impl.subscriptions.Subscription;
-import io.moquette.spi.impl.subscriptions.Topic;
+import io.moquette.broker.security.PermitAllAuthorizatorPolicy;
+import io.moquette.broker.subscriptions.CTrieSubscriptionDirectory;
+import io.moquette.broker.subscriptions.ISubscriptionsDirectory;
+import io.moquette.broker.subscriptions.Subscription;
+import io.moquette.broker.subscriptions.Topic;
+import io.moquette.persistence.MemorySubscriptionsRepository;
 import io.netty.buffer.Unpooled;
 import io.netty.channel.Channel;
 import io.netty.channel.embedded.EmbeddedChannel;
@@ -40,8 +52,9 @@ public class PostOfficeInternalPublishTest {
     private SessionRegistry sessionRegistry;
     private MockAuthenticator mockAuthenticator;
     private static final BrokerConfiguration ALLOW_ANONYMOUS_AND_ZERO_BYTES_CLID =
-        new BrokerConfiguration(true, true, false);
+        new BrokerConfiguration(true, true, false, false);
     private MemoryRetainedRepository retainedRepository;
+    private MemoryQueueRepository queueRepository;
 
     @Before
     public void setUp() {
@@ -66,16 +79,17 @@ public class PostOfficeInternalPublishTest {
     }
 
     private SessionRegistry initPostOfficeAndSubsystems() {
-        MemoryStorageService memStorage = new MemoryStorageService(null, null);
-        ISessionsStore sessionStore = memStorage.sessionsStore();
-
         subscriptions = new CTrieSubscriptionDirectory();
-        SessionsRepository sessionsRepository = new SessionsRepository(sessionStore, null);
-        subscriptions.init(sessionsRepository);
+        ISubscriptionsRepository subscriptionsRepository = new MemorySubscriptionsRepository();
+        subscriptions.init(subscriptionsRepository);
         retainedRepository = new MemoryRetainedRepository();
+        queueRepository = new MemoryQueueRepository();
 
-        SessionRegistry sessionRegistry = new SessionRegistry(subscriptions);
-        sut = new PostOffice(subscriptions, new PermitAllAuthorizatorPolicy(), retainedRepository, sessionRegistry);
+        final PermitAllAuthorizatorPolicy authorizatorPolicy = new PermitAllAuthorizatorPolicy();
+        final Authorizator permitAll = new Authorizator(authorizatorPolicy);
+        SessionRegistry sessionRegistry = new SessionRegistry(subscriptions, queueRepository, permitAll);
+        sut = new PostOffice(subscriptions, retainedRepository, sessionRegistry,
+                             ConnectionTestUtils.NO_OBSERVERS_INTERCEPTOR, permitAll);
         return sessionRegistry;
     }
 
@@ -93,7 +107,7 @@ public class PostOfficeInternalPublishTest {
             .retained(retained)
             .qos(qos)
             .payload(Unpooled.copiedBuffer(PAYLOAD.getBytes(UTF_8))).build();
-        sut.internalPublish(publish, "INTRPUBL");
+        sut.internalPublish(publish);
     }
 
     @Test
@@ -289,7 +303,6 @@ public class PostOfficeInternalPublishTest {
         final Subscription onlyMatchedSubscription = matchedSubscriptions.iterator().next();
         assertEquals(expectedSubscription, onlyMatchedSubscription);
     }
-
 
     private void verifyNoPublishIsReceived(EmbeddedChannel channel) {
         final Object messageReceived = channel.readOutbound();

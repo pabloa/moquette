@@ -1,13 +1,25 @@
+/*
+ * Copyright (c) 2012-2018 The original author or authors
+ * ------------------------------------------------------
+ * All rights reserved. This program and the accompanying materials
+ * are made available under the terms of the Eclipse Public License v1.0
+ * and Apache License v2.0 which accompanies this distribution.
+ *
+ * The Eclipse Public License is available at
+ * http://www.eclipse.org/legal/epl-v10.html
+ *
+ * The Apache License v2.0 is available at
+ * http://www.opensource.org/licenses/apache2.0.php
+ *
+ * You may elect to redistribute this code under either of these licenses.
+ */
 package io.moquette.broker;
 
-import io.moquette.persistence.MemoryStorageService;
-import io.moquette.spi.ISessionsStore;
-import io.moquette.spi.impl.MockAuthenticator;
-import io.moquette.spi.impl.SessionsRepository;
-import io.moquette.spi.impl.security.PermitAllAuthorizatorPolicy;
-import io.moquette.spi.impl.subscriptions.CTrieSubscriptionDirectory;
-import io.moquette.spi.impl.subscriptions.ISubscriptionsDirectory;
-import io.moquette.spi.security.IAuthenticator;
+import io.moquette.broker.security.PermitAllAuthorizatorPolicy;
+import io.moquette.broker.subscriptions.CTrieSubscriptionDirectory;
+import io.moquette.broker.subscriptions.ISubscriptionsDirectory;
+import io.moquette.broker.security.IAuthenticator;
+import io.moquette.persistence.MemorySubscriptionsRepository;
 import io.netty.buffer.Unpooled;
 import io.netty.channel.Channel;
 import io.netty.channel.embedded.EmbeddedChannel;
@@ -33,12 +45,13 @@ public class MQTTConnectionPublishTest {
     private EmbeddedChannel channel;
     private SessionRegistry sessionRegistry;
     private MqttMessageBuilders.ConnectBuilder connMsg;
+    private MemoryQueueRepository queueRepository;
 
     @Before
     public void setUp() {
         connMsg = MqttMessageBuilders.connect().protocolVersion(MqttVersion.MQTT_3_1).cleanSession(true);
 
-        BrokerConfiguration config = new BrokerConfiguration(true, true, false);
+        BrokerConfiguration config = new BrokerConfiguration(true, true, false, false);
 
         createMQTTConnection(config);
     }
@@ -49,17 +62,19 @@ public class MQTTConnectionPublishTest {
     }
 
     private MQTTConnection createMQTTConnection(BrokerConfiguration config, Channel channel) {
-        MemoryStorageService memStorage = new MemoryStorageService(null, null);
-        ISessionsStore sessionStore = memStorage.sessionsStore();
-        IAuthenticator mockAuthenticator = new MockAuthenticator(singleton(FAKE_CLIENT_ID), singletonMap(TEST_USER, TEST_PWD));
+        IAuthenticator mockAuthenticator = new MockAuthenticator(singleton(FAKE_CLIENT_ID),
+                                                                 singletonMap(TEST_USER, TEST_PWD));
 
         ISubscriptionsDirectory subscriptions = new CTrieSubscriptionDirectory();
-        SessionsRepository sessionsRepository = new SessionsRepository(sessionStore, null);
-        subscriptions.init(sessionsRepository);
+        ISubscriptionsRepository subscriptionsRepository = new MemorySubscriptionsRepository();
+        subscriptions.init(subscriptionsRepository);
+        queueRepository = new MemoryQueueRepository();
 
-        sessionRegistry = new SessionRegistry(subscriptions);
-        final PostOffice postOffice = new PostOffice(subscriptions, new PermitAllAuthorizatorPolicy(),
-                                                     new MemoryRetainedRepository(), sessionRegistry);
+        final PermitAllAuthorizatorPolicy authorizatorPolicy = new PermitAllAuthorizatorPolicy();
+        final Authorizator permitAll = new Authorizator(authorizatorPolicy);
+        sessionRegistry = new SessionRegistry(subscriptions, queueRepository, permitAll);
+        final PostOffice postOffice = new PostOffice(subscriptions,
+            new MemoryRetainedRepository(), sessionRegistry, ConnectionTestUtils.NO_OBSERVERS_INTERCEPTOR, permitAll);
         return new MQTTConnection(channel, config, mockAuthenticator, sessionRegistry, postOffice);
     }
 

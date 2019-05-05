@@ -1,17 +1,28 @@
+/*
+ * Copyright (c) 2012-2018 The original author or authors
+ * ------------------------------------------------------
+ * All rights reserved. This program and the accompanying materials
+ * are made available under the terms of the Eclipse Public License v1.0
+ * and Apache License v2.0 which accompanies this distribution.
+ *
+ * The Eclipse Public License is available at
+ * http://www.eclipse.org/legal/epl-v10.html
+ *
+ * The Apache License v2.0 is available at
+ * http://www.opensource.org/licenses/apache2.0.php
+ *
+ * You may elect to redistribute this code under either of these licenses.
+ */
 package io.moquette.broker;
 
-import io.moquette.persistence.MemoryStorageService;
-import io.moquette.server.netty.NettyUtils;
-import io.moquette.spi.ISessionsStore;
-import io.moquette.spi.impl.MockAuthenticator;
-import io.moquette.spi.impl.SessionsRepository;
-import io.moquette.spi.impl.security.PermitAllAuthorizatorPolicy;
-import io.moquette.spi.impl.subscriptions.CTrieSubscriptionDirectory;
-import io.moquette.spi.impl.subscriptions.ISubscriptionsDirectory;
-import io.moquette.spi.impl.subscriptions.Subscription;
-import io.moquette.spi.impl.subscriptions.Topic;
-import io.moquette.spi.security.IAuthenticator;
-import io.moquette.spi.security.IAuthorizatorPolicy;
+import io.moquette.broker.security.PermitAllAuthorizatorPolicy;
+import io.moquette.broker.subscriptions.CTrieSubscriptionDirectory;
+import io.moquette.broker.subscriptions.ISubscriptionsDirectory;
+import io.moquette.broker.subscriptions.Subscription;
+import io.moquette.broker.subscriptions.Topic;
+import io.moquette.broker.security.IAuthenticator;
+import io.moquette.broker.security.IAuthorizatorPolicy;
+import io.moquette.persistence.MemorySubscriptionsRepository;
 import io.netty.buffer.ByteBuf;
 import io.netty.buffer.Unpooled;
 import io.netty.channel.Channel;
@@ -53,7 +64,8 @@ public class PostOfficeSubscribeTest {
     private MqttConnectMessage connectMessage;
     private IAuthenticator mockAuthenticator;
     private SessionRegistry sessionRegistry;
-    public static final BrokerConfiguration CONFIG = new BrokerConfiguration(true, true, false);
+    public static final BrokerConfiguration CONFIG = new BrokerConfiguration(true, true, false, false);
+    private MemoryQueueRepository queueRepository;
 
     @Before
     public void setUp() {
@@ -71,17 +83,18 @@ public class PostOfficeSubscribeTest {
     }
 
     private void prepareSUT() {
-        MemoryStorageService memStorage = new MemoryStorageService(null, null);
-        ISessionsStore sessionStore = memStorage.sessionsStore();
         mockAuthenticator = new MockAuthenticator(singleton(FAKE_CLIENT_ID), singletonMap(TEST_USER, TEST_PWD));
 
         subscriptions = new CTrieSubscriptionDirectory();
-        SessionsRepository sessionsRepository = new SessionsRepository(sessionStore, null);
-        subscriptions.init(sessionsRepository);
+        ISubscriptionsRepository subscriptionsRepository = new MemorySubscriptionsRepository();
+        subscriptions.init(subscriptionsRepository);
+        queueRepository = new MemoryQueueRepository();
 
-        sessionRegistry = new SessionRegistry(subscriptions);
-        sut = new PostOffice(subscriptions, new PermitAllAuthorizatorPolicy(), new MemoryRetainedRepository(),
-                             sessionRegistry);
+        final PermitAllAuthorizatorPolicy authorizatorPolicy = new PermitAllAuthorizatorPolicy();
+        final Authorizator permitAll = new Authorizator(authorizatorPolicy);
+        sessionRegistry = new SessionRegistry(subscriptions, queueRepository, permitAll);
+        sut = new PostOffice(subscriptions, new MemoryRetainedRepository(), sessionRegistry,
+                             ConnectionTestUtils.NO_OBSERVERS_INTERCEPTOR, permitAll);
     }
 
     private MQTTConnection createMQTTConnection(BrokerConfiguration config, Channel channel) {
@@ -153,7 +166,8 @@ public class PostOfficeSubscribeTest {
         when(prohibitReadOnNewsTopic.canRead(eq(new Topic(NEWS_TOPIC)), eq(FAKE_USER_NAME), eq(FAKE_CLIENT_ID)))
             .thenReturn(false);
 
-        sut = new PostOffice(subscriptions, prohibitReadOnNewsTopic, new MemoryRetainedRepository(), sessionRegistry);
+        sut = new PostOffice(subscriptions, new MemoryRetainedRepository(), sessionRegistry,
+                             ConnectionTestUtils.NO_OBSERVERS_INTERCEPTOR, new Authorizator(prohibitReadOnNewsTopic));
 
         connection.processConnect(connectMessage);
         ConnectionTestUtils.assertConnectAccepted(channel);
@@ -170,7 +184,6 @@ public class PostOfficeSubscribeTest {
         verifyFailureQos(subAckMsg);
     }
 
-
     private void verifyFailureQos(MqttSubAckMessage subAckMsg) {
         List<Integer> grantedQoSes = subAckMsg.payload().grantedQoSLevels();
         assertEquals(1, grantedQoSes.size());
@@ -183,7 +196,7 @@ public class PostOfficeSubscribeTest {
         ConnectionTestUtils.assertConnectAccepted(channel);
         assertEquals("After CONNECT subscription MUST be empty", 0, subscriptions.size());
         subscribe(channel, NEWS_TOPIC, AT_MOST_ONCE);
-        assertEquals("After /news subscribe, subscription MUST contain it",1, subscriptions.size());
+        assertEquals("After /news subscribe, subscription MUST contain it", 1, subscriptions.size());
 
         //Exercise & verify
         subscribe(channel, NEWS_TOPIC, AT_MOST_ONCE);
@@ -203,7 +216,7 @@ public class PostOfficeSubscribeTest {
         this.sut.subscribeClientToTopics(subscribe, FAKE_CLIENT_ID, FAKE_USER_NAME, connection);
         MqttSubAckMessage subAckMsg = channel.readOutbound();
 
-        assertEquals("Bad topic CAN'T add any subscription",0, subscriptions.size());
+        assertEquals("Bad topic CAN'T add any subscription", 0, subscriptions.size());
         verifyFailureQos(subAckMsg);
     }
 
@@ -227,7 +240,12 @@ public class PostOfficeSubscribeTest {
         assertEquals("After a reconnect, subscription MUST be still present", 1, subscriptions.size());
 
         final ByteBuf payload = Unpooled.copiedBuffer("Hello world!", Charset.defaultCharset());
-        sut.receivedPublishQos0(new Topic(NEWS_TOPIC), TEST_USER, TEST_PWD, payload, false);
+        sut.receivedPublishQos0(new Topic(NEWS_TOPIC), TEST_USER, TEST_PWD, payload, false,
+            MqttMessageBuilders.publish()
+                .payload(payload.retainedDuplicate())
+                .qos(MqttQoS.AT_MOST_ONCE)
+                .retained(false)
+                .topicName(NEWS_TOPIC).build());
 
         ConnectionTestUtils.verifyPublishIsReceived(anotherChannel, AT_MOST_ONCE, "Hello world!");
     }
@@ -267,7 +285,12 @@ public class PostOfficeSubscribeTest {
 
         // publish on /news
         final ByteBuf payload = Unpooled.copiedBuffer("Hello world!", Charset.defaultCharset());
-        sut.receivedPublishQos0(new Topic(NEWS_TOPIC), TEST_USER, TEST_PWD, payload, false);
+        sut.receivedPublishQos0(new Topic(NEWS_TOPIC), TEST_USER, TEST_PWD, payload, false,
+            MqttMessageBuilders.publish()
+                .payload(payload)
+                .qos(MqttQoS.AT_MOST_ONCE)
+                .retained(false)
+                .topicName(NEWS_TOPIC).build());
 
         // verify no publish is fired
         ConnectionTestUtils.verifyNoPublishIsReceived(channel);

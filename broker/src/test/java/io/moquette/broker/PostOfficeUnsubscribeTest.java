@@ -1,15 +1,27 @@
+/*
+ * Copyright (c) 2012-2018 The original author or authors
+ * ------------------------------------------------------
+ * All rights reserved. This program and the accompanying materials
+ * are made available under the terms of the Eclipse Public License v1.0
+ * and Apache License v2.0 which accompanies this distribution.
+ *
+ * The Eclipse Public License is available at
+ * http://www.eclipse.org/legal/epl-v10.html
+ *
+ * The Apache License v2.0 is available at
+ * http://www.opensource.org/licenses/apache2.0.php
+ *
+ * You may elect to redistribute this code under either of these licenses.
+ */
 package io.moquette.broker;
 
-import io.moquette.persistence.MemoryStorageService;
-import io.moquette.spi.ISessionsStore;
-import io.moquette.spi.impl.MockAuthenticator;
-import io.moquette.spi.impl.SessionsRepository;
-import io.moquette.spi.impl.security.PermitAllAuthorizatorPolicy;
-import io.moquette.spi.impl.subscriptions.CTrieSubscriptionDirectory;
-import io.moquette.spi.impl.subscriptions.ISubscriptionsDirectory;
-import io.moquette.spi.impl.subscriptions.Subscription;
-import io.moquette.spi.impl.subscriptions.Topic;
-import io.moquette.spi.security.IAuthenticator;
+import io.moquette.broker.security.PermitAllAuthorizatorPolicy;
+import io.moquette.broker.subscriptions.CTrieSubscriptionDirectory;
+import io.moquette.broker.subscriptions.ISubscriptionsDirectory;
+import io.moquette.broker.subscriptions.Subscription;
+import io.moquette.broker.subscriptions.Topic;
+import io.moquette.broker.security.IAuthenticator;
+import io.moquette.persistence.MemorySubscriptionsRepository;
 import io.netty.buffer.ByteBuf;
 import io.netty.buffer.Unpooled;
 import io.netty.channel.Channel;
@@ -43,7 +55,8 @@ public class PostOfficeUnsubscribeTest {
     private MqttConnectMessage connectMessage;
     private IAuthenticator mockAuthenticator;
     private SessionRegistry sessionRegistry;
-    public static final BrokerConfiguration CONFIG = new BrokerConfiguration(true, true, false);
+    public static final BrokerConfiguration CONFIG = new BrokerConfiguration(true, true, false, false);
+    private MemoryQueueRepository queueRepository;
 
     @Before
     public void setUp() {
@@ -61,16 +74,18 @@ public class PostOfficeUnsubscribeTest {
     }
 
     private void prepareSUT() {
-        MemoryStorageService memStorage = new MemoryStorageService(null, null);
-        ISessionsStore sessionStore = memStorage.sessionsStore();
         mockAuthenticator = new MockAuthenticator(singleton(FAKE_CLIENT_ID), singletonMap(TEST_USER, TEST_PWD));
 
         subscriptions = new CTrieSubscriptionDirectory();
-        SessionsRepository sessionsRepository = new SessionsRepository(sessionStore, null);
-        subscriptions.init(sessionsRepository);
+        ISubscriptionsRepository subscriptionsRepository = new MemorySubscriptionsRepository();
+        subscriptions.init(subscriptionsRepository);
+        queueRepository = new MemoryQueueRepository();
 
-        sessionRegistry = new SessionRegistry(subscriptions);
-        sut = new PostOffice(subscriptions, new PermitAllAuthorizatorPolicy(), new MemoryRetainedRepository(), sessionRegistry);
+        final PermitAllAuthorizatorPolicy authorizatorPolicy = new PermitAllAuthorizatorPolicy();
+        final Authorizator permitAll = new Authorizator(authorizatorPolicy);
+        sessionRegistry = new SessionRegistry(subscriptions, queueRepository, permitAll);
+        sut = new PostOffice(subscriptions, new MemoryRetainedRepository(), sessionRegistry,
+                             ConnectionTestUtils.NO_OBSERVERS_INTERCEPTOR, permitAll);
     }
 
     private MQTTConnection createMQTTConnection(BrokerConfiguration config, Channel channel) {
@@ -128,7 +143,12 @@ public class PostOfficeUnsubscribeTest {
 
         // publish on /news
         final ByteBuf payload = Unpooled.copiedBuffer("Hello world!", Charset.defaultCharset());
-        sut.receivedPublishQos0(new Topic(NEWS_TOPIC), TEST_USER, TEST_PWD, payload, false);
+        sut.receivedPublishQos0(new Topic(NEWS_TOPIC), TEST_USER, TEST_PWD, payload, false,
+            MqttMessageBuilders.publish()
+                .payload(payload.retainedDuplicate())
+                .qos(MqttQoS.AT_MOST_ONCE)
+                .retained(false)
+                .topicName(NEWS_TOPIC).build());
 
         ConnectionTestUtils.verifyPublishIsReceived(channel, AT_MOST_ONCE, "Hello world!");
 
@@ -136,7 +156,12 @@ public class PostOfficeUnsubscribeTest {
 
         // publish on /news
         final ByteBuf payload2 = Unpooled.copiedBuffer("Hello world!", Charset.defaultCharset());
-        sut.receivedPublishQos0(new Topic(NEWS_TOPIC), TEST_USER, TEST_PWD, payload2, false);
+        sut.receivedPublishQos0(new Topic(NEWS_TOPIC), TEST_USER, TEST_PWD, payload2, false,
+            MqttMessageBuilders.publish()
+                .payload(payload)
+                .qos(MqttQoS.AT_MOST_ONCE)
+                .retained(false)
+                .topicName(NEWS_TOPIC).build());
 
         ConnectionTestUtils.verifyNoPublishIsReceived(channel);
     }
@@ -156,7 +181,12 @@ public class PostOfficeUnsubscribeTest {
         subscribe(connection, NEWS_TOPIC, AT_MOST_ONCE);
         // publish on /news
         final ByteBuf payload = Unpooled.copiedBuffer("Hello world!", Charset.defaultCharset());
-        sut.receivedPublishQos0(new Topic(NEWS_TOPIC), TEST_USER, TEST_PWD, payload, false);
+        sut.receivedPublishQos0(new Topic(NEWS_TOPIC), TEST_USER, TEST_PWD, payload, false,
+            MqttMessageBuilders.publish()
+                .payload(payload.retainedDuplicate())
+                .qos(MqttQoS.AT_MOST_ONCE)
+                .retained(false)
+                .topicName(NEWS_TOPIC).build());
 
         ConnectionTestUtils.verifyPublishIsReceived(channel, AT_MOST_ONCE, "Hello world!");
 
@@ -171,7 +201,12 @@ public class PostOfficeUnsubscribeTest {
 
         // publish on /news
         final ByteBuf payload2 = Unpooled.copiedBuffer("Hello world!", Charset.defaultCharset());
-        sut.receivedPublishQos0(new Topic(NEWS_TOPIC), TEST_USER, TEST_PWD, payload2, false);
+        sut.receivedPublishQos0(new Topic(NEWS_TOPIC), TEST_USER, TEST_PWD, payload2, false,
+            MqttMessageBuilders.publish()
+                .payload(payload2)
+                .qos(MqttQoS.AT_MOST_ONCE)
+                .retained(false)
+                .topicName(NEWS_TOPIC).build());
 
         ConnectionTestUtils.verifyNoPublishIsReceived(anotherChannel);
     }
@@ -213,7 +248,7 @@ public class PostOfficeUnsubscribeTest {
 
         // publish from another channel
         final ByteBuf anyPayload = Unpooled.copiedBuffer(firstPayload, Charset.defaultCharset());
-        sut.receivedPublishQos1(anotherConnection, new Topic(topic), TEST_USER, anyPayload, 1,false,
+        sut.receivedPublishQos1(anotherConnection, new Topic(topic), TEST_USER, anyPayload, 1, false,
             MqttMessageBuilders.publish()
                 .payload(Unpooled.copiedBuffer(firstPayload, Charset.defaultCharset()))
                 .qos(MqttQoS.AT_LEAST_ONCE)
@@ -246,7 +281,12 @@ public class PostOfficeUnsubscribeTest {
         subscribe(connection, NEWS_TOPIC, AT_MOST_ONCE);
         // publish on /news
         final ByteBuf payload = Unpooled.copiedBuffer("Hello world!", Charset.defaultCharset());
-        sut.receivedPublishQos0(new Topic(NEWS_TOPIC), TEST_USER, TEST_PWD, payload, false);
+        sut.receivedPublishQos0(new Topic(NEWS_TOPIC), TEST_USER, TEST_PWD, payload, false,
+            MqttMessageBuilders.publish()
+                .payload(payload.retainedDuplicate())
+                .qos(MqttQoS.AT_MOST_ONCE)
+                .retained(false)
+                .topicName(NEWS_TOPIC).build());
 
         ConnectionTestUtils.verifyPublishIsReceived((EmbeddedChannel) connection.channel, AT_MOST_ONCE, "Hello world!");
 
@@ -261,7 +301,12 @@ public class PostOfficeUnsubscribeTest {
         subscribe(subscriberConnection, NEWS_TOPIC, AT_MOST_ONCE);
         // publish on /news
         final ByteBuf payload2 = Unpooled.copiedBuffer("Hello world2!", Charset.defaultCharset());
-        sut.receivedPublishQos0(new Topic(NEWS_TOPIC), TEST_USER, TEST_PWD, payload2, false);
+        sut.receivedPublishQos0(new Topic(NEWS_TOPIC), TEST_USER, TEST_PWD, payload2, false,
+            MqttMessageBuilders.publish()
+                .payload(payload2.retainedDuplicate())
+                .qos(MqttQoS.AT_MOST_ONCE)
+                .retained(false)
+                .topicName(NEWS_TOPIC).build());
 
         ConnectionTestUtils.verifyPublishIsReceived(subscriberChannel, AT_MOST_ONCE, "Hello world2!");
 
@@ -293,7 +338,7 @@ public class PostOfficeUnsubscribeTest {
 
     private void publishQos1(MQTTConnection publisher, String topic, String payload, int messageID) {
         final ByteBuf bytePayload = Unpooled.copiedBuffer(payload, Charset.defaultCharset());
-        sut.receivedPublishQos1(publisher, new Topic(topic), TEST_USER, bytePayload, messageID,false,
+        sut.receivedPublishQos1(publisher, new Topic(topic), TEST_USER, bytePayload, messageID, false,
             MqttMessageBuilders.publish()
                 .payload(Unpooled.copiedBuffer(payload, Charset.defaultCharset()))
                 .qos(MqttQoS.AT_LEAST_ONCE)
@@ -307,7 +352,7 @@ public class PostOfficeUnsubscribeTest {
             .payload(bytePayload)
             .qos(MqttQoS.EXACTLY_ONCE)
             .retained(true)
-            .topicName(NEWS_TOPIC).build());
+            .topicName(NEWS_TOPIC).build(), "username");
     }
 
     /**

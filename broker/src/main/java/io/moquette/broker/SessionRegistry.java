@@ -1,9 +1,24 @@
+/*
+ * Copyright (c) 2012-2018 The original author or authors
+ * ------------------------------------------------------
+ * All rights reserved. This program and the accompanying materials
+ * are made available under the terms of the Eclipse Public License v1.0
+ * and Apache License v2.0 which accompanies this distribution.
+ *
+ * The Eclipse Public License is available at
+ * http://www.eclipse.org/legal/epl-v10.html
+ *
+ * The Apache License v2.0 is available at
+ * http://www.opensource.org/licenses/apache2.0.php
+ *
+ * You may elect to redistribute this code under either of these licenses.
+ */
 package io.moquette.broker;
 
 import io.moquette.broker.Session.SessionStatus;
-import io.moquette.spi.impl.subscriptions.ISubscriptionsDirectory;
-import io.moquette.spi.impl.subscriptions.Subscription;
-import io.moquette.spi.impl.subscriptions.Topic;
+import io.moquette.broker.subscriptions.ISubscriptionsDirectory;
+import io.moquette.broker.subscriptions.Subscription;
+import io.moquette.broker.subscriptions.Topic;
 import io.netty.buffer.ByteBuf;
 import io.netty.buffer.Unpooled;
 import io.netty.handler.codec.mqtt.MqttConnectMessage;
@@ -11,14 +26,17 @@ import io.netty.handler.codec.mqtt.MqttQoS;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import java.net.InetSocketAddress;
+import java.util.Collection;
+import java.util.Optional;
 import java.util.Queue;
 import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.ConcurrentMap;
+import java.util.stream.Collectors;
 
-class SessionRegistry {
+public class SessionRegistry {
 
-    static abstract class EnqueuedMessage {
+    public abstract static class EnqueuedMessage {
     }
 
     static class PublishedMessage extends EnqueuedMessage {
@@ -45,10 +63,16 @@ class SessionRegistry {
 
     private final ConcurrentMap<String, Session> pool = new ConcurrentHashMap<>();
     private final ISubscriptionsDirectory subscriptionsDirectory;
+    private final IQueueRepository queueRepository;
+    private final Authorizator authorizator;
     private final ConcurrentMap<String, Queue<SessionRegistry.EnqueuedMessage>> queues = new ConcurrentHashMap<>();
 
-    SessionRegistry(ISubscriptionsDirectory subscriptionsDirectory) {
+    SessionRegistry(ISubscriptionsDirectory subscriptionsDirectory,
+                    IQueueRepository queueRepository,
+                    Authorizator authorizator) {
         this.subscriptionsDirectory = subscriptionsDirectory;
+        this.queueRepository = queueRepository;
+        this.authorizator = authorizator;
     }
 
     void bindToSession(MQTTConnection mqttConnection, MqttConnectMessage msg, String clientId) {
@@ -74,7 +98,7 @@ class SessionRegistry {
             isSessionAlreadyStored = true;
         }
         final boolean msgCleanSessionFlag = msg.variableHeader().isCleanSession();
-        boolean isSessionAlreadyPresent = (!msgCleanSessionFlag && isSessionAlreadyStored);
+        boolean isSessionAlreadyPresent = !msgCleanSessionFlag && isSessionAlreadyStored;
         mqttConnection.sendConnAck(isSessionAlreadyPresent);
 
         if (postConnectAction == PostConnectAction.SEND_STORED_MESSAGES) {
@@ -112,7 +136,8 @@ class SessionRegistry {
             LOG.trace("case 2, oldSession with same CId {} disconnected", clientId);
         } else if (!newIsClean && oldSession.disconnected()) {
             // case 3
-            reactivateSubscriptions(oldSession);
+            final String username = mqttConnection.getUsername();
+            reactivateSubscriptions(oldSession, username);
 
             // mark as connected
             final boolean connecting = oldSession.assignState(SessionStatus.DISCONNECTED, SessionStatus.CONNECTING);
@@ -148,8 +173,14 @@ class SessionRegistry {
         return postConnectAction;
     }
 
-    private void reactivateSubscriptions(Session session) {
+    private void reactivateSubscriptions(Session session, String username) {
+        //verify if subscription still satisfy read ACL permissions
         for (Subscription existingSub : session.getSubscriptions()) {
+            final boolean topicReadable = authorizator.canRead(existingSub.getTopicFilter(), username,
+                                                               session.getClientID());
+            if (!topicReadable) {
+                subscriptionsDirectory.removeSubscription(existingSub.getTopicFilter(), session.getClientID());
+            }
             // TODO
 //            subscriptionsDirectory.reactivate(existingSub.getTopicFilter(), session.getClientID());
         }
@@ -162,14 +193,15 @@ class SessionRegistry {
     }
 
     private Session createNewSession(MQTTConnection mqttConnection, MqttConnectMessage msg, String clientId) {
-        final Queue<SessionRegistry.EnqueuedMessage> sessionQueue = queues.computeIfAbsent(clientId, (String cli) -> new ConcurrentLinkedQueue<>());
         final boolean clean = msg.variableHeader().isCleanSession();
+        final Queue<SessionRegistry.EnqueuedMessage> sessionQueue =
+                    queues.computeIfAbsent(clientId, (String cli) -> queueRepository.createQueue(cli, clean));
         final Session newSession;
         if (msg.variableHeader().isWillFlag()) {
             final Session.Will will = createWill(msg);
             newSession = new Session(clientId, clean, will, sessionQueue);
         } else {
-            newSession = new Session(clean, clientId, sessionQueue);
+            newSession = new Session(clientId, clean, sessionQueue);
         }
 
         newSession.markConnected();
@@ -216,5 +248,20 @@ class SessionRegistry {
 
     private void dropQueuesForClient(String clientId) {
         queues.remove(clientId);
+    }
+
+    Collection<ClientDescriptor> listConnectedClients() {
+        return pool.values().stream()
+            .filter(Session::connected)
+            .map(this::createClientDescriptor)
+            .filter(Optional::isPresent)
+            .map(Optional::get)
+            .collect(Collectors.toList());
+    }
+
+    private Optional<ClientDescriptor> createClientDescriptor(Session s) {
+        final String clientID = s.getClientID();
+        final Optional<InetSocketAddress> remoteAddressOpt = s.remoteAddress();
+        return remoteAddressOpt.map(r -> new ClientDescriptor(clientID, r.getHostString(), r.getPort()));
     }
 }

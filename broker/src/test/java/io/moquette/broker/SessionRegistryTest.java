@@ -1,14 +1,25 @@
+/*
+ * Copyright (c) 2012-2018 The original author or authors
+ * ------------------------------------------------------
+ * All rights reserved. This program and the accompanying materials
+ * are made available under the terms of the Eclipse Public License v1.0
+ * and Apache License v2.0 which accompanies this distribution.
+ *
+ * The Eclipse Public License is available at
+ * http://www.eclipse.org/legal/epl-v10.html
+ *
+ * The Apache License v2.0 is available at
+ * http://www.opensource.org/licenses/apache2.0.php
+ *
+ * You may elect to redistribute this code under either of these licenses.
+ */
 package io.moquette.broker;
 
-import io.moquette.persistence.MemoryStorageService;
-import io.moquette.server.netty.NettyUtils;
-import io.moquette.spi.ISessionsStore;
-import io.moquette.spi.impl.MockAuthenticator;
-import io.moquette.spi.impl.SessionsRepository;
-import io.moquette.spi.impl.security.PermitAllAuthorizatorPolicy;
-import io.moquette.spi.impl.subscriptions.CTrieSubscriptionDirectory;
-import io.moquette.spi.impl.subscriptions.ISubscriptionsDirectory;
-import io.moquette.spi.security.IAuthenticator;
+import io.moquette.broker.security.PermitAllAuthorizatorPolicy;
+import io.moquette.broker.subscriptions.CTrieSubscriptionDirectory;
+import io.moquette.broker.subscriptions.ISubscriptionsDirectory;
+import io.moquette.broker.security.IAuthenticator;
+import io.moquette.persistence.MemorySubscriptionsRepository;
 import io.netty.channel.Channel;
 import io.netty.channel.embedded.EmbeddedChannel;
 import io.netty.handler.codec.mqtt.MqttConnectMessage;
@@ -17,36 +28,26 @@ import io.netty.handler.codec.mqtt.MqttVersion;
 import org.junit.Before;
 import org.junit.Test;
 
-import static io.moquette.spi.impl.NettyChannelAssertions.assertEqualsConnAck;
+import static io.moquette.broker.NettyChannelAssertions.assertEqualsConnAck;
 import static io.netty.handler.codec.mqtt.MqttConnectReturnCode.CONNECTION_ACCEPTED;
 import static java.util.Collections.singleton;
 import static java.util.Collections.singletonMap;
 import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertTrue;
-import static org.mockito.Matchers.eq;
-import static org.mockito.Mockito.mock;
-import static org.mockito.Mockito.verify;
 
 public class SessionRegistryTest {
 
     static final String FAKE_CLIENT_ID = "FAKE_123";
-    static final String FAKE_CLIENT_ID2 = "FAKE_456";
-    static final String PUBLISHER_ID = "Publisher";
-    private static final String SUBSCRIBER_ID = "Subscriber";
-    static final String NEWS_TOPIC = "/news";
-    static final String BAD_FORMATTED_TOPIC = "#MQTTClient";
-
     static final String TEST_USER = "fakeuser";
     static final String TEST_PWD = "fakepwd";
-    static final String EVIL_TEST_USER = "eviluser";
-    static final String EVIL_TEST_PWD = "unsecret";
 
     private MQTTConnection connection;
     private EmbeddedChannel channel;
     private SessionRegistry sut;
     private MqttMessageBuilders.ConnectBuilder connMsg;
     private static final BrokerConfiguration ALLOW_ANONYMOUS_AND_ZEROBYTE_CLIENT_ID =
-        new BrokerConfiguration(true, true, false);
+        new BrokerConfiguration(true, true, false, false);
+    private MemoryQueueRepository queueRepository;
 
     @Before
     public void setUp() {
@@ -61,17 +62,19 @@ public class SessionRegistryTest {
     }
 
     private MQTTConnection createMQTTConnection(BrokerConfiguration config, Channel channel) {
-        MemoryStorageService memStorage = new MemoryStorageService(null, null);
-        ISessionsStore sessionStore = memStorage.sessionsStore();
-        IAuthenticator mockAuthenticator = new MockAuthenticator(singleton(FAKE_CLIENT_ID), singletonMap(TEST_USER, TEST_PWD));
+        IAuthenticator mockAuthenticator = new MockAuthenticator(singleton(FAKE_CLIENT_ID),
+                                                                 singletonMap(TEST_USER, TEST_PWD));
 
         ISubscriptionsDirectory subscriptions = new CTrieSubscriptionDirectory();
-        SessionsRepository sessionsRepository = new SessionsRepository(sessionStore, null);
-        subscriptions.init(sessionsRepository);
+        ISubscriptionsRepository subscriptionsRepository = new MemorySubscriptionsRepository();
+        subscriptions.init(subscriptionsRepository);
+        queueRepository = new MemoryQueueRepository();
 
-        sut = new SessionRegistry(subscriptions);
-        final PostOffice postOffice = new PostOffice(subscriptions, new PermitAllAuthorizatorPolicy(),
-                                                     new MemoryRetainedRepository(), sut);
+        final PermitAllAuthorizatorPolicy authorizatorPolicy = new PermitAllAuthorizatorPolicy();
+        final Authorizator permitAll = new Authorizator(authorizatorPolicy);
+        sut = new SessionRegistry(subscriptions, queueRepository, permitAll);
+        final PostOffice postOffice = new PostOffice(subscriptions,
+            new MemoryRetainedRepository(), sut, ConnectionTestUtils.NO_OBSERVERS_INTERCEPTOR, permitAll);
         return new MQTTConnection(channel, config, mockAuthenticator, sut, postOffice);
     }
 
